@@ -148,6 +148,7 @@ async fn put_object_simple(
     data: Vec<u8>,
 ) -> Result<usize> {
     let size = data.len();
+    println!("[PUT] Starting simple upload for key: {} (size: {} bytes)", key, size);
     let body = ByteStream::from(data);
     
     client
@@ -159,6 +160,7 @@ async fn put_object_simple(
         .await
         .context("Failed to put object")?;
     
+    println!("[PUT] Completed simple upload for key: {}", key);
     Ok(size)
 }
 
@@ -170,6 +172,9 @@ async fn put_object_multipart(
     part_size: usize,
 ) -> Result<usize> {
     let total_size = data.len();
+    let num_parts = (total_size + part_size - 1) / part_size;
+    
+    println!("[PUT-MP] Starting multipart upload for key: {} (size: {} bytes, {} parts)", key, total_size, num_parts);
     
     // Initiate multipart upload
     let multipart = client
@@ -181,36 +186,71 @@ async fn put_object_multipart(
         .context("Failed to create multipart upload")?;
     
     let upload_id = multipart.upload_id().context("No upload ID")?;
+    println!("[PUT-MP] Created upload ID: {} for key: {}", upload_id, key);
     
-    // Upload parts
-    let mut completed_parts = Vec::new();
+    // Upload parts in parallel
+    let mut upload_tasks = Vec::new();
     let mut part_number = 1;
     
     for chunk in data.chunks(part_size) {
-        let body = ByteStream::from(Bytes::copy_from_slice(chunk));
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        let upload_id = upload_id.to_string();
+        let chunk_data = Bytes::copy_from_slice(chunk);
+        let current_part = part_number;
         
-        let upload_part = client
-            .upload_part()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .body(body)
-            .send()
-            .await
-            .context(format!("Failed to upload part {}", part_number))?;
+        println!("[PUT-MP] Spawning upload task for part {} of {} for key: {}", current_part, num_parts, key);
         
-        completed_parts.push(
-            CompletedPart::builder()
-                .part_number(part_number)
-                .e_tag(upload_part.e_tag().unwrap_or_default())
-                .build(),
-        );
+        let task = tokio::spawn(async move {
+            println!("[PUT-MP] Uploading part {} for key: {}", current_part, key);
+            let body = ByteStream::from(chunk_data);
+            
+            let result = client
+                .upload_part()
+                .bucket(bucket)
+                .key(&key)
+                .upload_id(upload_id)
+                .part_number(current_part)
+                .body(body)
+                .send()
+                .await;
+            
+            match &result {
+                Ok(_) => println!("[PUT-MP] Completed part {} for key: {}", current_part, key),
+                Err(e) => println!("[PUT-MP] Failed part {} for key: {} - {:?}", current_part, key, e),
+            }
+            
+            result.map(|resp| (current_part, resp))
+        });
         
+        upload_tasks.push(task);
         part_number += 1;
     }
     
+    println!("[PUT-MP] Waiting for {} parallel part uploads to complete for key: {}", upload_tasks.len(), key);
+    
+    // Collect results from all parallel uploads
+    let mut completed_parts = Vec::new();
+    for task in upload_tasks {
+        let (part_num, upload_result) = task
+            .await
+            .context("Upload part task panicked")?
+            .context("Failed to upload part")?;
+        
+        completed_parts.push(
+            CompletedPart::builder()
+                .part_number(part_num)
+                .e_tag(upload_result.e_tag().unwrap_or_default())
+                .build(),
+        );
+    }
+    
+    // Sort parts by part number (important for S3)
+    completed_parts.sort_by_key(|p| p.part_number());
+    
     // Complete multipart upload
+    println!("[PUT-MP] Completing multipart upload for key: {}", key);
     let completed_upload = CompletedMultipartUpload::builder()
         .set_parts(Some(completed_parts))
         .build();
@@ -225,10 +265,12 @@ async fn put_object_multipart(
         .await
         .context("Failed to complete multipart upload")?;
     
+    println!("[PUT-MP] Successfully completed multipart upload for key: {}", key);
     Ok(total_size)
 }
 
 async fn get_object(client: &S3Client, bucket: &str, key: &str) -> Result<usize> {
+    println!("[GET] Starting download for key: {}", key);
     let resp = client
         .get_object()
         .bucket(bucket)
@@ -238,10 +280,13 @@ async fn get_object(client: &S3Client, bucket: &str, key: &str) -> Result<usize>
         .context("Failed to get object")?;
     
     let data = resp.body.collect().await.context("Failed to read body")?;
-    Ok(data.into_bytes().len())
+    let size = data.into_bytes().len();
+    println!("[GET] Completed download for key: {} (size: {} bytes)", key, size);
+    Ok(size)
 }
 
 async fn get_object_range(client: &S3Client, bucket: &str, key: &str, range_bytes: usize) -> Result<usize> {
+    println!("[GET-RANGE] Starting range download for key: {} (first {} bytes)", key, range_bytes);
     let range = format!("bytes=0-{}", range_bytes - 1);
     let resp = client
         .get_object()
@@ -253,14 +298,19 @@ async fn get_object_range(client: &S3Client, bucket: &str, key: &str, range_byte
         .context("Failed to get object range")?;
     
     let data = resp.body.collect().await.context("Failed to read body")?;
-    Ok(data.into_bytes().len())
+    let size = data.into_bytes().len();
+    println!("[GET-RANGE] Completed range download for key: {} (size: {} bytes)", key, size);
+    Ok(size)
 }
 
 async fn list_objects(client: &S3Client, bucket: &str, prefix: &str) -> Result<usize> {
+    println!("[LIST] Starting list operation with prefix: '{}'", prefix);
     let mut count = 0;
     let mut continuation_token: Option<String> = None;
+    let mut page = 1;
     
     loop {
+        println!("[LIST] Fetching page {} for prefix: '{}'", page, prefix);
         let mut request = client.list_objects_v2().bucket(bucket).max_keys(1000);
         
         if !prefix.is_empty() {
@@ -273,15 +323,19 @@ async fn list_objects(client: &S3Client, bucket: &str, prefix: &str) -> Result<u
         
         let resp = request.send().await.context("Failed to list objects")?;
         
-        count += resp.contents().len();
+        let page_count = resp.contents().len();
+        count += page_count;
+        println!("[LIST] Page {} returned {} objects (total so far: {})", page, page_count, count);
         
         if resp.is_truncated() == Some(true) {
             continuation_token = resp.next_continuation_token().map(String::from);
+            page += 1;
         } else {
             break;
         }
     }
     
+    println!("[LIST] Completed list operation with prefix: '{}' (total: {} objects)", prefix, count);
     Ok(count)
 }
 
@@ -329,8 +383,11 @@ async fn run_put_benchmark(
         let client = client.clone();
         let bucket = bucket.clone();
         let key = format!("{}{}-{}", prefix, operation_count, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+        
+        println!("[BENCH] Generating random data for operation {} (size: {} bytes)", operation_count, object_size);
         let data = generate_random_data(object_size);
         
+        println!("[BENCH] Spawning PUT task {} for key: {}", operation_count, key);
         let task = tokio::spawn(async move {
             let op_start = Instant::now();
             let result = if disable_multipart || object_size < part_size {
@@ -353,19 +410,31 @@ async fn run_put_benchmark(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     
+    println!("[BENCH] Duration reached, waiting for {} in-flight operations to complete...", tasks.len());
     pb.finish_with_message("Waiting for all operations to complete...");
     
     // Wait for all tasks to complete
-    for task in tasks {
+    println!("[BENCH] Collecting results from {} tasks...", tasks.len());
+    for (idx, task) in tasks.into_iter().enumerate() {
+        println!("[BENCH] Waiting for task {} of {} to complete...", idx + 1, operation_count);
         match task.await {
             Ok((Ok(size), latency)) => {
+                println!("[BENCH] Task {} succeeded: {} bytes in {:.2}ms", idx + 1, size, latency.as_secs_f64() * 1000.0);
                 bytes_transferred += size as u64;
                 total_latency_ms += latency.as_secs_f64() * 1000.0;
             }
-            Ok((Err(_), _)) => errors += 1,
-            Err(_) => errors += 1,
+            Ok((Err(e), _)) => {
+                println!("[BENCH] Task {} failed with error: {:?}", idx + 1, e);
+                errors += 1;
+            }
+            Err(e) => {
+                println!("[BENCH] Task {} panicked: {:?}", idx + 1, e);
+                errors += 1;
+            }
         }
     }
+    
+    println!("[BENCH] All PUT tasks completed!");
     
     let total_duration = start.elapsed();
     
@@ -464,6 +533,7 @@ async fn run_get_benchmark(
         let key = objects[object_index % objects.len()].clone();
         object_index += 1;
         
+        println!("[BENCH] Spawning GET task {} for key: {}", operation_count, key);
         let task = tokio::spawn(async move {
             let op_start = Instant::now();
             let result = if let Some(bytes) = range_bytes {
@@ -485,19 +555,31 @@ async fn run_get_benchmark(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     
+    println!("[BENCH] Duration reached, waiting for {} in-flight GET operations to complete...", tasks.len());
     pb.finish_with_message("Waiting for all operations to complete...");
     
     // Wait for all tasks to complete
-    for task in tasks {
+    println!("[BENCH] Collecting results from {} GET tasks...", tasks.len());
+    for (idx, task) in tasks.into_iter().enumerate() {
+        println!("[BENCH] Waiting for GET task {} of {} to complete...", idx + 1, operation_count);
         match task.await {
             Ok((Ok(size), latency)) => {
+                println!("[BENCH] GET task {} succeeded: {} bytes in {:.2}ms", idx + 1, size, latency.as_secs_f64() * 1000.0);
                 bytes_transferred += size as u64;
                 total_latency_ms += latency.as_secs_f64() * 1000.0;
             }
-            Ok((Err(_), _)) => errors += 1,
-            Err(_) => errors += 1,
+            Ok((Err(e), _)) => {
+                println!("[BENCH] GET task {} failed with error: {:?}", idx + 1, e);
+                errors += 1;
+            }
+            Err(e) => {
+                println!("[BENCH] GET task {} panicked: {:?}", idx + 1, e);
+                errors += 1;
+            }
         }
     }
+    
+    println!("[BENCH] All GET tasks completed!");
     
     let total_duration = start.elapsed();
     
@@ -554,6 +636,7 @@ async fn run_list_benchmark(
         let bucket = bucket.clone();
         let prefix = prefix.clone();
         
+        println!("[BENCH] Spawning LIST task {} with prefix: '{}'", operation_count, prefix);
         let task = tokio::spawn(async move {
             let op_start = Instant::now();
             let result = list_objects(&client, &bucket, &prefix).await;
@@ -571,19 +654,31 @@ async fn run_list_benchmark(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     
+    println!("[BENCH] Duration reached, waiting for {} in-flight LIST operations to complete...", tasks.len());
     pb.finish_with_message("Waiting for all operations to complete...");
     
     // Wait for all tasks to complete
-    for task in tasks {
+    println!("[BENCH] Collecting results from {} LIST tasks...", tasks.len());
+    for (idx, task) in tasks.into_iter().enumerate() {
+        println!("[BENCH] Waiting for LIST task {} of {} to complete...", idx + 1, operation_count);
         match task.await {
             Ok((Ok(count), latency)) => {
+                println!("[BENCH] LIST task {} succeeded: {} objects in {:.2}ms", idx + 1, count, latency.as_secs_f64() * 1000.0);
                 total_objects_listed += count as u64;
                 total_latency_ms += latency.as_secs_f64() * 1000.0;
             }
-            Ok((Err(_), _)) => errors += 1,
-            Err(_) => errors += 1,
+            Ok((Err(e), _)) => {
+                println!("[BENCH] LIST task {} failed with error: {:?}", idx + 1, e);
+                errors += 1;
+            }
+            Err(e) => {
+                println!("[BENCH] LIST task {} panicked: {:?}", idx + 1, e);
+                errors += 1;
+            }
         }
     }
+    
+    println!("[BENCH] All LIST tasks completed!");
     
     let total_duration = start.elapsed();
     

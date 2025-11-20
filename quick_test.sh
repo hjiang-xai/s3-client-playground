@@ -14,7 +14,7 @@ echo "======================================================="
 
 # Quick PUT test with 1GiB objects and 8MiB parts
 echo ""
-echo "Testing PUT (1GiB objects, 8MiB parts, 100 concurrent, 10 seconds)..."
+echo "Testing PUT (1GiB objects, 8MiB parts, 10 concurrent, 10 seconds)..."
 cargo run --release -- put \
   --endpoint "$ENDPOINT" \
   --bucket "$BUCKET" \
@@ -22,14 +22,14 @@ cargo run --release -- put \
   --secret-key "$SECRET_KEY" \
   --region "$REGION" \
   --duration-secs 10 \
-  --concurrent 100 \
+  --concurrent 10 \
   --object-size 1073741824 \
   --part-size 8388608 \
   --prefix "quicktest/"
 
 # Quick GET test with range query (read first 100 bytes)
 echo ""
-echo "Testing GET with range query (first 100 bytes, 100 concurrent, 10 seconds)..."
+echo "Testing GET with range query (first 100 bytes, 10 concurrent, 10 seconds)..."
 cargo run --release -- get \
   --endpoint "$ENDPOINT" \
   --bucket "$BUCKET" \
@@ -37,13 +37,13 @@ cargo run --release -- get \
   --secret-key "$SECRET_KEY" \
   --region "$REGION" \
   --duration-secs 10 \
-  --concurrent 100 \
+  --concurrent 10 \
   --prefix "quicktest/" \
   --range-bytes 100
 
 # Quick LIST test
 echo ""
-echo "Testing LIST (100 concurrent, 10 seconds)..."
+echo "Testing LIST (10 concurrent, 10 seconds)..."
 cargo run --release -- list \
   --endpoint "$ENDPOINT" \
   --bucket "$BUCKET" \
@@ -51,7 +51,7 @@ cargo run --release -- list \
   --secret-key "$SECRET_KEY" \
   --region "$REGION" \
   --duration-secs 10 \
-  --concurrent 100 \
+  --concurrent 10 \
   --prefix "quicktest/"
 
 echo ""
